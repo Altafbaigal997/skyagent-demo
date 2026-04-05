@@ -3,12 +3,22 @@ import time
 import re
 import random
 import hashlib
+import json
+import os
 from datetime import datetime, timedelta
 
+try:
+    from groq import Groq
+    GROQ_AVAILABLE = True
+except ImportError:
+    GROQ_AVAILABLE = False
+
+# ════════════════════════════════════════════════════════════════════════════════
 # PAGE CONFIG & STATE INITIALIZATION
+# ════════════════════════════════════════════════════════════════════════════════
 
 st.set_page_config(
-    page_title="ABC AI · Your AI Travel Agent",
+    page_title="SkyAgent AI · Your AI Travel Agent",
     page_icon="✈️",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -28,15 +38,217 @@ if "messages" not in st.session_state:
     st.session_state.hotel_confirmation_id = None
     st.session_state.greeted = False
 
+# ════════════════════════════════════════════════════════════════════════════════
+# LLM ENGINE (Groq - Llama 3.3 70B)
+# ════════════════════════════════════════════════════════════════════════════════
+
+def get_groq_client():
+    """Get Groq client from secrets, env, or sidebar input."""
+    api_key = None
+    # Try Streamlit secrets first (for Streamlit Cloud deployment)
+    try:
+        api_key = st.secrets.get("GROQ_API_KEY", None)
+    except Exception:
+        pass
+    # Try environment variable
+    if not api_key:
+        api_key = os.environ.get("GROQ_API_KEY", "")
+    # Try session state (from sidebar input)
+    if not api_key and "groq_api_key" in st.session_state:
+        api_key = st.session_state.groq_api_key
+    if api_key and GROQ_AVAILABLE:
+        return Groq(api_key=api_key)
+    return None
+
+
+def match_city_name(name):
+    """Match an LLM-extracted city name to CITY_DB. Returns (code, display) or (None, None)."""
+    if not name:
+        return None, None
+    name_lower = name.lower().strip()
+    # Exact key match
+    if name_lower in CITY_DB:
+        return CITY_DB[name_lower]
+    # Match against display names
+    for key, (code, display) in CITY_DB.items():
+        if display.lower() == name_lower:
+            return code, display
+    # Partial match (e.g., "new york city" → "new york")
+    for key, (code, display) in sorted(CITY_DB.items(), key=lambda x: -len(x[0])):
+        if key in name_lower or name_lower in key:
+            return code, display
+    return None, None
+
+
+def llm_parse(user_input, stage):
+    """Use Groq LLM to parse user intent and extract entities, with conversation context."""
+    client = get_groq_client()
+    if not client:
+        return None
+
+    city_list = ", ".join(sorted(set(display for _, (_, display) in CITY_DB.items())))
+    today = datetime.now().strftime("%A, %B %d, %Y")
+
+    # ── Build booking context so LLM knows current state ──
+    booking_context = "CURRENT BOOKING STATE:\n"
+    if st.session_state.selected_flight:
+        f = st.session_state.selected_flight
+        booking_context += (
+            f"- Flight BOOKED: {f['airline']} {f['flight_num']}, "
+            f"{f['origin_name']} → {f['dest_name']}, "
+            f"{f['date']}, PNR: {st.session_state.pnr or 'N/A'}, "
+            f"${f['price']}.00\n"
+        )
+    else:
+        booking_context += "- No flight booked yet\n"
+
+    if st.session_state.selected_hotel:
+        h = st.session_state.selected_hotel
+        room_cost = h["price_per_night"] * h["nights"]
+        taxes = int(room_cost * 0.13)
+        service_fee = int(room_cost * 0.05)
+        total = room_cost + taxes + service_fee
+        booking_context += (
+            f"- Hotel BOOKED: {h['name']} ({h['stars']}★), "
+            f"{h['area']}, {h['room_type']}, {h['nights']} nights, "
+            f"Confirmation: {st.session_state.hotel_confirmation_id or 'N/A'}, "
+            f"${total}.00 {h['currency']}\n"
+        )
+    else:
+        booking_context += "- No hotel booked yet\n"
+
+    # ── Build recent conversation history (last 6 messages) ──
+    recent_history = ""
+    msgs = st.session_state.messages[-6:] if st.session_state.messages else []
+    if msgs:
+        recent_history = "RECENT CONVERSATION:\n"
+        for msg in msgs:
+            role = "User" if msg["role"] == "user" else "Agent"
+            content = msg.get("content", "")
+            if content:
+                # Truncate long messages
+                if len(content) > 200:
+                    content = content[:200] + "..."
+                recent_history += f"  {role}: {content}\n"
+
+    system_prompt = f"""You are the intent parser for SkyAgent AI, a flight and hotel booking assistant.
+
+Today's date is: {today}
+Current conversation stage: {stage}
+
+{booking_context}
+{recent_history}
+SUPPORTED CITIES (only these are available for booking):
+{city_list}
+
+Your job: Extract the user's intent and entities from their LATEST message, using the conversation history and booking state for context. Return ONLY valid JSON.
+
+JSON schema:
+{{
+  "intent": "search_flight" | "select_option" | "confirm" | "cancel" | "ask_hotel" | "ask_itinerary" | "skip" | "check_status" | "new_search" | "cancel_booking" | "cancel_hotel" | "general",
+  "origin": "city name as said by user" or null,
+  "destination": "city name as said by user" or null,
+  "origin_supported": true/false (is the origin city in the SUPPORTED CITIES list above?),
+  "destination_supported": true/false (is the destination city in the SUPPORTED CITIES list above?),
+  "date": "resolved date like Friday, April 11, 2026" or null,
+  "date_valid": true/false (is the date valid and in the future?),
+  "date_error": "past_date" | "no_date" | "vague_date" | null,
+  "budget": number or null,
+  "selection": 1 or 2 or 3 or null,
+  "is_yes": true/false,
+  "is_no": true/false,
+  "agent_reply": "natural travel agent response" or null
+}}
+
+RULES:
+1. DATES — this is critical for accuracy:
+   - Resolve ALL relative dates to actual calendar dates using today's date. "next Friday" → calculate the actual date. "tomorrow" → calculate. "June 15" → resolve to the NEXT occurrence (2026 or 2027). Always return format: "DayOfWeek, Month Day, Year" (e.g., "Friday, April 18, 2026").
+   - If user says a PAST date (e.g., "April 21, 2025" when today is in 2026), set date_valid=false and date_error="past_date".
+   - If user says a vague date like "next weekend", resolve to the specific Saturday date. "This weekend" → the coming Saturday. "Next weekend" → the Saturday after this weekend.
+   - If user gives a date without a year (e.g., "March 15"), assume the NEXT future occurrence. If March 15 has passed in 2026, use March 15, 2027.
+   - If NO date is mentioned at all, set date to null and date_error="no_date".
+   - If the date is ambiguous or unclear (e.g., "sometime in summer"), set date to null and date_error="vague_date".
+2. CITIES: Check if the mentioned cities are in the SUPPORTED CITIES list. Set origin_supported/destination_supported accordingly. Be case-insensitive.
+3. SELECTION: Extract option numbers from phrases like "book option 2", "the first one", "hotel 3", "#2", "second" → 2.
+4. INTENT CLASSIFICATION — this is critical. Use the CONVERSATION HISTORY and BOOKING STATE to understand context:
+   - "search_flight": user wants to find or search for flights
+   - "select_option": user is choosing an option (flight 1, hotel 2, etc.)
+   - "confirm": user is saying YES to proceed with a payment or action. Also use for "yes please cancel" when agent just asked "Shall I proceed with cancellation?"
+   - "cancel": user is saying NO / declining the current action being offered (e.g., declining payment, declining hotel search)
+   - "cancel_booking": user wants to CANCEL AN EXISTING FLIGHT BOOKING. Look at booking state — if a flight is booked and user says "cancel it", "cancel my booking", "cancel the flight", "I don't want this flight", this is cancel_booking. Also if user says "cancel it" and the conversation was about the flight, this is cancel_booking.
+   - "cancel_hotel": user wants to CANCEL AN EXISTING HOTEL RESERVATION. If a hotel is booked and user says "cancel hotel", "cancel my room", "cancel the hotel reservation", this is cancel_hotel.
+   - "ask_hotel": user is asking about hotels
+   - "ask_itinerary": user wants an itinerary
+   - "skip": user wants to skip the current step
+   - "check_status": user wants to check booking status
+   - "new_search": user EXPLICITLY wants to start a completely new search/trip. Only use this if user says things like "new search", "start over", "plan a different trip". Do NOT use this for cancellation requests.
+   - "general": anything else — chitchat, questions about the service, etc.
+5. CONTEXT RESOLUTION — this is very important:
+   - Use conversation history to resolve pronouns. "cancel it" → look at what was last discussed. If the agent just showed a flight booking, "it" = the flight. If the agent just showed a hotel, "it" = the hotel.
+   - "yes, cancel and also cancel the flight" → TWO intents. Pick the most actionable one: cancel_booking (since the hotel cancel was already being processed).
+   - "did you cancel it?" after a cancellation discussion → check_status intent.
+   - If the user says "yes" after the agent asked "Shall I proceed with cancellation?" → intent is "confirm", is_yes=true.
+6. AGENT_REPLY: Fill this when intent is "general", when a city is not supported, or when you need to confirm/acknowledge a cancellation confirmation. For unsupported cities, write a friendly message listing alternatives. For general questions, respond as a helpful travel agent. Keep replies concise (2-3 sentences max).
+7. If the user mentions a city for origin but not destination (or vice versa), only fill what's mentioned. Don't guess.
+8. is_yes/is_no: Set these for simple affirmative/negative responses. Do NOT set is_no=true when intent is "cancel_booking" or "cancel_hotel" — those are booking actions, not negative responses.
+9. If user says "yes", "sure", "go ahead" → is_yes=true. If "no", "nah", "skip" → is_no=true."""
+
+    try:
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_input}
+            ],
+            temperature=0.1,
+            max_tokens=500,
+            response_format={"type": "json_object"},
+        )
+        result = json.loads(response.choices[0].message.content)
+        return result
+    except Exception as e:
+        st.write(f"")  # silent fail
+        return None
+
+
+# ════════════════════════════════════════════════════════════════════════════════
 # CUSTOM CSS
+# ════════════════════════════════════════════════════════════════════════════════
 
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,500;0,9..40,700&family=Space+Mono:wght@400;700&display=swap');
 
 /* ── Global ── */
-section[data-testid="stMain"] { background: #f5f7fb; }
+section[data-testid="stMain"] { background: #f5f7fb !important; }
 div[data-testid="stChatMessage"] { font-family: 'DM Sans', sans-serif; }
+[data-testid="stAppViewContainer"] { background: #f5f7fb !important; }
+[data-testid="stHeader"] { background: transparent !important; }
+[data-testid="stChatInput"] textarea { font-family: 'DM Sans', sans-serif !important; }
+p, span, li, div { color: inherit; }
+
+/* ── App Header Banner ── */
+.app-header {
+    text-align: center;
+    padding: 30px 20px 24px 20px;
+    margin: -10px -1rem 20px -1rem;
+    background: linear-gradient(135deg, #0f172a 0%, #1e3a5f 50%, #0f172a 100%);
+    border-radius: 0 0 24px 24px;
+    box-shadow: 0 4px 20px rgba(15,23,42,0.15);
+}
+.app-header-icon { font-size: 40px; margin-bottom: 6px; }
+.app-header-title {
+    font-family: 'DM Sans', sans-serif;
+    font-size: 28px; font-weight: 700;
+    color: #ffffff !important;
+    letter-spacing: 0.5px;
+    margin-bottom: 4px;
+}
+.app-header-sub {
+    font-family: 'DM Sans', sans-serif;
+    font-size: 13px; color: #94a3b8 !important;
+    letter-spacing: 0.3px;
+}
 
 /* ── Sidebar ── */
 section[data-testid="stSidebar"] {
@@ -311,7 +523,9 @@ section[data-testid="stSidebar"] hr { border-color: rgba(255,255,255,0.08); }
 </style>
 """, unsafe_allow_html=True)
 
+# ════════════════════════════════════════════════════════════════════════════════
 # DATA: CITIES, AIRLINES, ITINERARIES
+# ════════════════════════════════════════════════════════════════════════════════
 
 CITY_DB = {
     "lahore": ("LHE", "Lahore"), "karachi": ("KHI", "Karachi"),
@@ -480,7 +694,9 @@ DEFAULT_ITINERARY_TEMPLATE = [
 ]
 
 
+# ════════════════════════════════════════════════════════════════════════════════
 # DATA: HOTELS
+# ════════════════════════════════════════════════════════════════════════════════
 
 HOTEL_DB = {
     "london": [
@@ -648,7 +864,9 @@ DEFAULT_HOTELS = [
 ]
 
 
+# ════════════════════════════════════════════════════════════════════════════════
 # FLIGHT GENERATION
+# ════════════════════════════════════════════════════════════════════════════════
 
 def generate_flights(origin_code, origin_name, dest_code, dest_name, date_str, budget=None):
     """Generate 3 realistic mock flights."""
@@ -751,7 +969,9 @@ def generate_hotels(dest_name, date_str, nights=3):
     return hotels
 
 
+# ════════════════════════════════════════════════════════════════════════════════
 # INTENT PARSING
+# ════════════════════════════════════════════════════════════════════════════════
 
 def find_city(text):
     """Find a city name in text."""
@@ -890,7 +1110,9 @@ def wants_itinerary(text):
     return is_affirmative(text) or any(w in text_lower for w in ["itinerary", "plan", "schedule", "activities"])
 
 
+# ════════════════════════════════════════════════════════════════════════════════
 # HTML CARD RENDERERS
+# ════════════════════════════════════════════════════════════════════════════════
 
 def render_flight_card(flight, idx):
     best_html = '<span class="best-badge">★ BEST VALUE</span>' if flight.get("best") else ""
@@ -904,7 +1126,7 @@ def render_flight_card(flight, idx):
         '<div class="route-row">'
         '<div class="route-point">'
         f'<div class="route-time">{flight["departure"]}</div>'
-        f'<div class="route-code">{flight["origin_code"]}</div>'
+        f'<div class="route-code">{flight["origin_name"]} ({flight["origin_code"]})</div>'
         '</div>'
         '<div class="route-line-wrapper">'
         f'<div class="route-duration">{flight["duration"]}</div>'
@@ -913,7 +1135,7 @@ def render_flight_card(flight, idx):
         '</div>'
         '<div class="route-point">'
         f'<div class="route-time">{flight["arrival"]}</div>'
-        f'<div class="route-code">{flight["dest_code"]}</div>'
+        f'<div class="route-code">{flight["dest_name"]} ({flight["dest_code"]})</div>'
         '</div>'
         '</div>'
         '<div style="display:flex;justify-content:space-between;align-items:flex-end;margin-top:4px;">'
@@ -1180,27 +1402,285 @@ def render_hotel_confirmation_card(hotel, booking_ref, confirmation_id):
     )
 
 
+# ════════════════════════════════════════════════════════════════════════════════
 # CONVERSATION ENGINE
+# ════════════════════════════════════════════════════════════════════════════════
 
 def process_message(user_input):
-    """Main state machine — returns list of (type, content) tuples."""
+    """Main state machine with LLM-enhanced parsing. Falls back to rule-based if LLM unavailable."""
     stage = st.session_state.stage
     responses = []
 
-    if stage == "greeting" or stage == "searching":
-        trip = parse_trip_request(user_input)
+    # ── LLM PARSING (with fallback) ──
+    parsed = llm_parse(user_input, stage)
+    use_llm = parsed is not None
 
-        if not trip["dest_code"]:
-            responses.append(("text", "I'd love to help you find flights! Could you tell me where you'd like to go? For example: *\"Find me flights from Lahore to London next Friday under $800\"*"))
+    # Helper: get yes/no from LLM or fallback
+    def check_yes():
+        if use_llm:
+            return parsed.get("is_yes", False)
+        return is_affirmative(user_input)
+
+    def check_no():
+        if use_llm:
+            return parsed.get("is_no", False)
+        return is_negative(user_input)
+
+    def get_selection():
+        if use_llm and parsed.get("selection"):
+            return parsed["selection"]
+        return parse_selection(user_input)
+
+    def get_intent():
+        if use_llm:
+            return parsed.get("intent", "")
+        return ""
+
+    # ── HANDLE CROSS-CUTTING INTENTS AT ANY STAGE ──
+    # These intents should work regardless of what stage the user is in
+    if use_llm:
+        intent = get_intent()
+        safe_stages = ("payment_confirm", "hotel_payment_confirm")  # Don't interrupt active payment
+
+        # General conversation
+        if intent == "general" and stage not in safe_stages:
+            reply = parsed.get("agent_reply", "")
+            if reply:
+                responses.append(("text", reply))
+                return responses
+
+        # Cancel booking — works at any stage after a booking exists
+        if intent == "cancel_booking" and stage not in safe_stages:
+            if st.session_state.pnr and st.session_state.selected_flight:
+                pnr = st.session_state.pnr
+                flight = st.session_state.selected_flight
+                responses.append(("text",
+                    f"I can help with that. For flight booking **{pnr}** "
+                    f"({flight['airline']} {flight['flight_num']}, "
+                    f"{flight['origin_name']} → {flight['dest_name']}):\n\n"
+                    f"✅ This booking is currently within the **free cancellation window**. "
+                    f"A full refund of **${flight['price']}.00** "
+                    f"would be issued to your Visa ending in 4242.\n\n"
+                    f"Shall I proceed with the cancellation? The refund typically takes "
+                    f"5–10 business days to appear on your statement."
+                ))
+                st.session_state.stage = "complete"
+                return responses
+            else:
+                responses.append(("text", "You don't have any active flight bookings to cancel. Would you like to search for flights?"))
+                return responses
+
+        # Cancel hotel — works at any stage after a hotel is booked
+        if intent == "cancel_hotel" and stage not in safe_stages:
+            if st.session_state.selected_hotel:
+                hotel = st.session_state.selected_hotel
+                conf_id = st.session_state.hotel_confirmation_id or "N/A"
+                room_cost = hotel["price_per_night"] * hotel["nights"]
+                taxes = int(room_cost * 0.13)
+                service_fee = int(room_cost * 0.05)
+                total = room_cost + taxes + service_fee
+                responses.append(("text",
+                    f"I can help with that. For hotel reservation **{conf_id}** "
+                    f"({hotel['name']}, {hotel['stars']}★ in {hotel['area']}, "
+                    f"{hotel['room_type']} for {hotel['nights']} nights):\n\n"
+                    f"✅ This reservation is within the **{hotel['cancel'].lower()}** window. "
+                    f"A full refund of **${total}.00 {hotel['currency']}** "
+                    f"would be issued to your Visa ending in 4242.\n\n"
+                    f"Shall I proceed with the hotel cancellation? The refund typically takes "
+                    f"5–10 business days to appear on your statement."
+                ))
+                st.session_state.stage = "complete"
+                return responses
+            else:
+                responses.append(("text", "You don't have any active hotel reservations to cancel. Would you like to search for hotels?"))
+                return responses
+
+        # Check booking status — works at any stage
+        if intent == "check_status" and stage not in safe_stages:
+            if st.session_state.pnr:
+                status_parts = [f"📊 **Booking Status for {st.session_state.pnr}:**\n"]
+                status_parts.append(f"• Flight: **Confirmed** ✅")
+                status_parts.append(f"• Payment: **Completed** ✅")
+                status_parts.append(f"• E-ticket: **Delivered** ✅")
+                if st.session_state.selected_hotel:
+                    h = st.session_state.selected_hotel
+                    status_parts.append(f"• Hotel ({h['name']}): **Confirmed** ✅")
+                status_parts.append(f"\nEverything looks good! Need anything else?")
+                responses.append(("text", "\n".join(status_parts)))
+            else:
+                responses.append(("text", "You don't have any active bookings yet. Want to search for flights?"))
             return responses
 
-        if not trip["origin_code"]:
-            trip["origin_code"] = "LHE"
-            trip["origin_name"] = "Lahore"
+        # New search / start over — works at any stage except active payment
+        if intent in ("new_search", "search_flight") and stage not in safe_stages and stage not in ("greeting", "searching"):
+            # If it's a search_flight with a destination, restart and process it
+            if intent == "search_flight" and parsed.get("destination"):
+                st.session_state.stage = "greeting"
+                st.session_state.flights = []
+                st.session_state.selected_flight = None
+                st.session_state.hotels = []
+                st.session_state.selected_hotel = None
+                return process_message(user_input)
+            elif intent == "new_search":
+                st.session_state.stage = "greeting"
+                st.session_state.flights = []
+                st.session_state.selected_flight = None
+                st.session_state.hotels = []
+                st.session_state.selected_hotel = None
+                responses.append(("text", "Let's plan another trip! Where would you like to go?"))
+                return responses
 
+    # ═══════════════════════════════════════════════════════
+    # STAGE: GREETING / SEARCHING
+    # ═══════════════════════════════════════════════════════
+    if stage == "greeting" or stage == "searching":
+
+        # ── LLM PATH ──
+        if use_llm:
+            intent = get_intent()
+            origin_raw = parsed.get("origin")
+            dest_raw = parsed.get("destination")
+            origin_ok = parsed.get("origin_supported", True)
+            dest_ok = parsed.get("destination_supported", True)
+            date_str = parsed.get("date")
+            budget = parsed.get("budget")
+
+            # Handle non-search intents
+            if intent == "general" and parsed.get("agent_reply"):
+                responses.append(("text", parsed["agent_reply"]))
+                return responses
+
+            if intent == "greeting":
+                responses.append(("text",
+                    "Hey there! 👋 Ready to plan your next trip? "
+                    "Just tell me where you'd like to go — for example: "
+                    "*\"Find me flights from Lahore to London next Friday under $800\"*"
+                ))
+                return responses
+
+            # ── DATE VALIDATION (check past dates BEFORE anything else) ──
+            date_valid = parsed.get("date_valid", True)
+            date_error = parsed.get("date_error")
+
+            if date_error == "past_date" or (date_str and not date_valid):
+                raw_date = date_str or "that date"
+                extra = ""
+                if not dest_raw:
+                    extra = " Also, please let me know your destination city."
+                responses.append(("text",
+                    f"It looks like **{raw_date}** is in the past — I can only search for future travel dates. "
+                    f"Could you give me an upcoming date?{extra} For example:\n\n"
+                    f"• *\"Find me flights from Lahore to London next Friday\"*\n"
+                    f"• *\"Book a flight to Dubai on April 20, 2026\"*"
+                ))
+                return responses
+
+            # Destination not provided
+            if not dest_raw:
+                responses.append(("text",
+                    "I'd love to help you find flights! Could you tell me where you'd like to go? "
+                    "For example: *\"Find me flights from Lahore to London next Friday under $800\"*"
+                ))
+                return responses
+
+            # Destination not in our database
+            if dest_raw and not dest_ok:
+                reply = parsed.get("agent_reply", "")
+                if reply:
+                    responses.append(("text", reply))
+                else:
+                    supported = ", ".join(sorted(set(d for _, (_, d) in CITY_DB.items())))
+                    responses.append(("text",
+                        f"I'm sorry, I don't have flight data for **{dest_raw}** yet. "
+                        f"I currently support these cities:\n\n{supported}\n\n"
+                        f"Would you like to search for flights to one of these destinations?"
+                    ))
+                return responses
+
+            # Origin not in database
+            if origin_raw and not origin_ok:
+                reply = parsed.get("agent_reply", "")
+                if reply:
+                    responses.append(("text", reply))
+                else:
+                    responses.append(("text",
+                        f"I don't have departure data for **{origin_raw}** yet. "
+                        f"Would you like to depart from a different city? "
+                        f"I support Lahore, Karachi, Islamabad, Dubai, London, and many more."
+                    ))
+                return responses
+
+            # Match cities to database
+            dest_code, dest_name = match_city_name(dest_raw)
+            if not dest_code:
+                responses.append(("text",
+                    f"I couldn't find **{dest_raw}** in my database. Could you double-check the city name?"
+                ))
+                return responses
+
+            if origin_raw:
+                origin_code, origin_name = match_city_name(origin_raw)
+                if not origin_code:
+                    origin_code, origin_name = "LHE", "Lahore"
+            else:
+                origin_code, origin_name = "LHE", "Lahore"
+
+            # ── DATE VALIDATION (remaining checks after cities resolved) ──
+            # Vague date
+            if date_error == "vague_date":
+                responses.append(("text",
+                    f"I'd love to help, but I need a more specific travel date. "
+                    f"Could you tell me when you'd like to fly? For example:\n\n"
+                    f"• *\"next Friday\"*\n"
+                    f"• *\"June 15\"*\n"
+                    f"• *\"tomorrow\"*\n"
+                    f"• *\"this Saturday\"*"
+                ))
+                return responses
+
+            # No date provided — ask for it
+            if date_error == "no_date" or not date_str:
+                responses.append(("text",
+                    f"Great — I can search flights from **{origin_name}** to **{dest_name}**! "
+                    f"When would you like to travel? Just give me a date, like:\n\n"
+                    f"• *\"next Friday\"*\n"
+                    f"• *\"April 20\"*\n"
+                    f"• *\"this weekend\"*"
+                ))
+                # Save partial trip so the next message only needs a date
+                st.session_state.trip = {
+                    "origin_code": origin_code, "origin_name": origin_name,
+                    "dest_code": dest_code, "dest_name": dest_name,
+                    "date": None, "budget": budget,
+                }
+                st.session_state.stage = "awaiting_date"
+                return responses
+
+            trip = {
+                "origin_code": origin_code, "origin_name": origin_name,
+                "dest_code": dest_code, "dest_name": dest_name,
+                "date": date_str, "budget": budget,
+            }
+
+        # ── RULE-BASED FALLBACK ──
+        else:
+            trip = parse_trip_request(user_input)
+
+            if not trip["dest_code"]:
+                responses.append(("text",
+                    "I'd love to help you find flights! Could you tell me where you'd like to go? "
+                    "For example: *\"Find me flights from Lahore to London next Friday under $800\"*"
+                ))
+                return responses
+
+            if not trip["origin_code"]:
+                trip["origin_code"] = "LHE"
+                trip["origin_name"] = "Lahore"
+
+        # ── COMMON: Search and display flights ──
         st.session_state.trip = trip
 
-        budget_note = f" within your **${trip['budget']}** budget" if trip["budget"] else ""
+        budget_note = f" within your **${trip['budget']}** budget" if trip.get("budget") else ""
         responses.append(("text",
             f"Got it! Let me search for flights from **{trip['origin_name']} ({trip['origin_code']})** "
             f"to **{trip['dest_name']} ({trip['dest_code']})** on **{trip['date']}**{budget_note}."
@@ -1221,7 +1701,6 @@ def process_message(user_input):
             cards_html += render_flight_card(f, i)
         responses.append(("html", cards_html))
 
-        # Recommendation
         best = [f for f in flights if f.get("best")]
         if best:
             b = best[0]
@@ -1235,8 +1714,91 @@ def process_message(user_input):
 
         st.session_state.stage = "flights_shown"
 
+    # ═══════════════════════════════════════════════════════
+    # STAGE: AWAITING DATE
+    # ═══════════════════════════════════════════════════════
+    elif stage == "awaiting_date":
+        # User is providing a date for an already-identified route
+        trip = st.session_state.trip
+        date_str = None
+        date_error = None
+
+        if use_llm:
+            date_str = parsed.get("date")
+            date_error = parsed.get("date_error")
+            date_valid = parsed.get("date_valid", True)
+
+            if date_error == "past_date" or not date_valid:
+                raw_date = date_str or "that date"
+                responses.append(("text",
+                    f"**{raw_date}** is in the past — I need a future date. When would you like to fly?"
+                ))
+                return responses
+
+            if date_error == "vague_date" or (not date_str and date_error != "no_date"):
+                responses.append(("text",
+                    f"Could you be a bit more specific? Try something like *\"next Friday\"* or *\"April 20\"*."
+                ))
+                return responses
+
+            if not date_str:
+                responses.append(("text",
+                    f"I still need a travel date. When would you like to fly from "
+                    f"**{trip['origin_name']}** to **{trip['dest_name']}**?"
+                ))
+                return responses
+        else:
+            # Rule-based date extraction
+            fallback_trip = parse_trip_request(user_input)
+            date_str = fallback_trip.get("date")
+            if not date_str:
+                target = datetime.now() + timedelta(days=7)
+                date_str = target.strftime("%A, %B %d, %Y")
+
+        trip["date"] = date_str
+        st.session_state.trip = trip
+        st.session_state.stage = "greeting"
+
+        # Now process as a normal search
+        budget_note = f" within your **${trip['budget']}** budget" if trip.get("budget") else ""
+        responses.append(("text",
+            f"Got it! Let me search for flights from **{trip['origin_name']} ({trip['origin_code']})** "
+            f"to **{trip['dest_name']} ({trip['dest_code']})** on **{trip['date']}**{budget_note}."
+        ))
+        responses.append(("thinking", "Searching 200+ flights across 15 airlines..."))
+
+        flights = generate_flights(
+            trip["origin_code"], trip["origin_name"],
+            trip["dest_code"], trip["dest_name"],
+            trip["date"], trip.get("budget"),
+        )
+        st.session_state.flights = flights
+
+        responses.append(("text", f"I found **{len(flights)} great options** for you:\n"))
+
+        cards_html = ""
+        for i, f in enumerate(flights, 1):
+            cards_html += render_flight_card(f, i)
+        responses.append(("html", cards_html))
+
+        best = [f for f in flights if f.get("best")]
+        if best:
+            b = best[0]
+            idx = flights.index(b) + 1
+            reason = "best balance of price, flight time, and airline quality"
+            responses.append(("text",
+                f"💡 **My recommendation:** Option {idx} ({b['airline']}) — {reason}.\n\n"
+                f"To book, just say **\"Book option 1\"**, **\"Book option 2\"**, or **\"Book option 3\"**. "
+                f"Or tell me if you'd like to adjust the search."
+            ))
+
+        st.session_state.stage = "flights_shown"
+
+    # ═══════════════════════════════════════════════════════
+    # STAGE: FLIGHTS SHOWN
+    # ═══════════════════════════════════════════════════════
     elif stage == "flights_shown":
-        selection = parse_selection(user_input)
+        selection = get_selection()
         if selection and 1 <= selection <= len(st.session_state.flights):
             flight = st.session_state.flights[selection - 1]
             st.session_state.selected_flight = flight
@@ -1262,8 +1824,11 @@ def process_message(user_input):
                 "**\"Book option 2\"**, or **\"Book option 3\"**."
             ))
 
+    # ═══════════════════════════════════════════════════════
+    # STAGE: PAYMENT CONFIRM
+    # ═══════════════════════════════════════════════════════
     elif stage == "payment_confirm":
-        if is_affirmative(user_input):
+        if check_yes():
             flight = st.session_state.selected_flight
             booking_ref = st.session_state.booking_ref
             pnr = ''.join(random.choices("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", k=6))
@@ -1282,7 +1847,7 @@ def process_message(user_input):
             ))
             st.session_state.stage = "offer_hotel"
 
-        elif is_negative(user_input):
+        elif check_no():
             responses.append(("text",
                 "No problem — payment cancelled. No charge has been made.\n\n"
                 "Would you like to pick a different flight, or start a new search?"
@@ -1294,8 +1859,18 @@ def process_message(user_input):
                 "Please say **\"Confirm\"** to proceed or **\"Cancel\"** to go back."
             ))
 
+    # ═══════════════════════════════════════════════════════
+    # STAGE: OFFER HOTEL
+    # ═══════════════════════════════════════════════════════
     elif stage == "offer_hotel":
-        if is_affirmative(user_input) or any(w in user_input.lower() for w in ["hotel", "stay", "room", "yes", "sure", "find"]):
+        wants_hotel = check_yes() or (use_llm and get_intent() in ("ask_hotel", "confirm"))
+        skip = check_no() or (use_llm and get_intent() == "skip")
+
+        if not use_llm:
+            wants_hotel = wants_hotel or any(w in user_input.lower() for w in ["hotel", "stay", "room", "find"])
+            skip = skip or "skip" in user_input.lower()
+
+        if wants_hotel:
             flight = st.session_state.selected_flight
             dest = flight["dest_name"]
 
@@ -1329,7 +1904,7 @@ def process_message(user_input):
 
             st.session_state.stage = "hotels_shown"
 
-        elif is_negative(user_input) or "skip" in user_input.lower():
+        elif skip:
             flight = st.session_state.selected_flight
             responses.append(("text",
                 f"No worries! Your flight is all set. Would you like me to "
@@ -1342,9 +1917,13 @@ def process_message(user_input):
                 "Just say **yes** to see options, or **skip** to move on to itinerary planning."
             ))
 
+    # ═══════════════════════════════════════════════════════
+    # STAGE: HOTELS SHOWN
+    # ═══════════════════════════════════════════════════════
     elif stage == "hotels_shown":
-        text_lower = user_input.lower()
-        if "skip" in text_lower or is_negative(user_input):
+        skip = check_no() or (use_llm and get_intent() == "skip") or "skip" in user_input.lower()
+
+        if skip:
             flight = st.session_state.selected_flight
             responses.append(("text",
                 f"Got it — skipping hotel booking. Would you like me to "
@@ -1352,7 +1931,7 @@ def process_message(user_input):
             ))
             st.session_state.stage = "offer_itinerary"
         else:
-            selection = parse_selection(user_input)
+            selection = get_selection()
             if selection and 1 <= selection <= len(st.session_state.hotels):
                 hotel = st.session_state.hotels[selection - 1]
                 st.session_state.selected_hotel = hotel
@@ -1384,8 +1963,11 @@ def process_message(user_input):
                     "**\"Book hotel 2\"**, or **\"Book hotel 3\"**. Or say **\"skip\"** to move on."
                 ))
 
+    # ═══════════════════════════════════════════════════════
+    # STAGE: HOTEL PAYMENT CONFIRM
+    # ═══════════════════════════════════════════════════════
     elif stage == "hotel_payment_confirm":
-        if is_affirmative(user_input):
+        if check_yes():
             hotel = st.session_state.selected_hotel
             hotel_ref = st.session_state.hotel_booking_ref
             conf_id = ''.join(random.choices("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", k=8))
@@ -1406,7 +1988,7 @@ def process_message(user_input):
             ))
             st.session_state.stage = "offer_itinerary"
 
-        elif is_negative(user_input):
+        elif check_no():
             responses.append(("text",
                 "Hotel payment cancelled — no charge has been made.\n\n"
                 "Would you like to pick a different hotel, or skip to itinerary planning?"
@@ -1418,8 +2000,15 @@ def process_message(user_input):
                 "Please say **\"Confirm\"** to proceed or **\"Cancel\"** to go back."
             ))
 
+    # ═══════════════════════════════════════════════════════
+    # STAGE: OFFER ITINERARY
+    # ═══════════════════════════════════════════════════════
     elif stage == "offer_itinerary":
-        if wants_itinerary(user_input):
+        wants_it = check_yes() or (use_llm and get_intent() == "ask_itinerary")
+        if not use_llm:
+            wants_it = wants_it or wants_itinerary(user_input)
+
+        if wants_it:
             flight = st.session_state.selected_flight
             dest = flight["dest_name"]
             responses.append(("thinking", f"Generating personalized itinerary for {dest}..."))
@@ -1428,14 +2017,14 @@ def process_message(user_input):
             responses.append(("text",
                 "📋 You can adjust any part of this itinerary — just tell me what to add, "
                 "remove, or change.\n\n"
-                "Need anything else? I can help you update your trip, make any changes"
+                "Need anything else? I can help you find hotels, update your trip, "
                 "or start planning another journey!"
             ))
             st.session_state.stage = "complete"
-        elif is_negative(user_input):
+        elif check_no():
             responses.append(("text",
-                "No worries! Your flight is booked and confirmed. "
-                "If you need anything else — hotels, itinerary changes, "
+                "No worries! Your bookings are confirmed. "
+                "If you need anything else — itinerary changes, "
                 "or a new trip — just let me know!"
             ))
             st.session_state.stage = "complete"
@@ -1445,10 +2034,22 @@ def process_message(user_input):
                 "Just say **yes** or **no**."
             ))
 
+    # ═══════════════════════════════════════════════════════
+    # STAGE: COMPLETE
+    # ═══════════════════════════════════════════════════════
     elif stage == "complete":
-        # Handle follow-up requests or new searches
-        text_lower = user_input.lower()
-        if any(w in text_lower for w in ["hotel", "stay", "accommodation", "room"]):
+        intent = get_intent()
+
+        # LLM-driven intent routing
+        if use_llm and intent == "search_flight":
+            st.session_state.stage = "greeting"
+            st.session_state.flights = []
+            st.session_state.selected_flight = None
+            st.session_state.hotels = []
+            st.session_state.selected_hotel = None
+            return process_message(user_input)
+
+        elif use_llm and intent in ("ask_hotel",):
             if st.session_state.selected_hotel:
                 h = st.session_state.selected_hotel
                 responses.append(("text",
@@ -1456,58 +2057,106 @@ def process_message(user_input):
                     f"for {h['nights']} nights.\n\n"
                     f"Would you like to search for a different hotel, or is there anything else I can help with?"
                 ))
+            elif st.session_state.selected_flight:
+                st.session_state.stage = "offer_hotel"
+                return process_message("yes")
             else:
-                flight = st.session_state.selected_flight
-                if flight:
-                    responses.append(("text",
-                        f"Let me find hotels for your trip to **{flight['dest_name']}**!"
-                    ))
-                    st.session_state.stage = "offer_hotel"
-                    # Re-process as offer_hotel
-                    return process_message("yes")
-                else:
-                    responses.append(("text",
-                        "I'd love to help find a hotel! Could you tell me which city and dates you need?"
-                    ))
-        elif any(w in text_lower for w in ["new", "another", "different", "search", "flight", "book", "find"]):
+                responses.append(("text", "I'd love to help find a hotel! Let's search for flights first so I can coordinate your trip."))
+
+        elif use_llm and intent == "cancel_booking":
+            pnr = st.session_state.pnr or "N/A"
+            if st.session_state.selected_flight:
+                responses.append(("text",
+                    f"I can help with that. For booking **{pnr}**:\n\n"
+                    f"✅ This booking is currently within the **free cancellation window**. "
+                    f"A full refund of **${st.session_state.selected_flight['price']}.00** "
+                    f"would be issued to your Visa ending in 4242.\n\n"
+                    f"Shall I proceed with the cancellation? The refund typically takes "
+                    f"5–10 business days to appear on your statement."
+                ))
+            else:
+                responses.append(("text", "You don't have any active bookings to cancel."))
+
+        elif use_llm and intent == "check_status":
+            if st.session_state.pnr:
+                responses.append(("text",
+                    f"📊 **Booking Status for {st.session_state.pnr}:**\n\n"
+                    f"• Status: **Confirmed** ✅\n"
+                    f"• Payment: **Completed** ✅\n"
+                    f"• E-ticket: **Delivered** ✅\n\n"
+                    f"Everything looks good! Need anything else?"
+                ))
+            else:
+                responses.append(("text", "You don't have any active bookings yet. Want to search for flights?"))
+
+        elif use_llm and intent == "new_search":
             st.session_state.stage = "greeting"
             st.session_state.flights = []
             st.session_state.selected_flight = None
             st.session_state.hotels = []
             st.session_state.selected_hotel = None
             responses.append(("text", "Let's plan another trip! Where would you like to go?"))
-        elif any(w in text_lower for w in ["cancel", "refund"]):
-            pnr = st.session_state.pnr or "N/A"
-            responses.append(("text",
-                f"I can help with that. For booking **{pnr}**:\n\n"
-                f"✅ This booking is currently within the **free cancellation window**. "
-                f"A full refund of **${st.session_state.selected_flight['price']}.00** "
-                f"would be issued to your Visa ending in 4242.\n\n"
-                f"Shall I proceed with the cancellation? The refund typically takes "
-                f"5–10 business days to appear on your statement."
-            ))
-        elif any(w in text_lower for w in ["status", "where", "refund status"]):
-            responses.append(("text",
-                f"📊 **Booking Status for {st.session_state.pnr}:**\n\n"
-                f"• Status: **Confirmed** ✅\n"
-                f"• Payment: **Completed** ✅\n"
-                f"• E-ticket: **Delivered** ✅\n\n"
-                f"Everything looks good! Need anything else?"
-            ))
+
+        elif use_llm and parsed.get("agent_reply"):
+            responses.append(("text", parsed["agent_reply"]))
+
+        # Rule-based fallback for complete stage
         else:
-            responses.append(("text",
-                "I'm here to help! I can:\n\n"
-                "• **Search for flights** — just tell me where and when\n"
-                "• **Check your booking status** — ask about your current trip\n"
-                "• **Plan an itinerary** — I'll create a day-by-day plan\n"
-                "• **Help with cancellations** — I'll handle the refund process\n\n"
-                "What would you like to do?"
-            ))
+            text_lower = user_input.lower()
+            if any(w in text_lower for w in ["hotel", "stay", "accommodation", "room"]):
+                if st.session_state.selected_hotel:
+                    h = st.session_state.selected_hotel
+                    responses.append(("text",
+                        f"You already have a hotel booked: **{h['name']}** ({h['stars']}★) in {h['area']} "
+                        f"for {h['nights']} nights.\n\n"
+                        f"Would you like to search for a different hotel, or is there anything else I can help with?"
+                    ))
+                elif st.session_state.selected_flight:
+                    st.session_state.stage = "offer_hotel"
+                    return process_message("yes")
+                else:
+                    responses.append(("text", "I'd love to help find a hotel! Could you tell me which city and dates you need?"))
+            elif any(w in text_lower for w in ["new", "another", "different", "search", "flight", "book", "find"]):
+                st.session_state.stage = "greeting"
+                st.session_state.flights = []
+                st.session_state.selected_flight = None
+                st.session_state.hotels = []
+                st.session_state.selected_hotel = None
+                responses.append(("text", "Let's plan another trip! Where would you like to go?"))
+            elif any(w in text_lower for w in ["cancel", "refund"]):
+                pnr = st.session_state.pnr or "N/A"
+                responses.append(("text",
+                    f"I can help with that. For booking **{pnr}**:\n\n"
+                    f"✅ This booking is currently within the **free cancellation window**. "
+                    f"A full refund of **${st.session_state.selected_flight['price']}.00** "
+                    f"would be issued to your Visa ending in 4242.\n\n"
+                    f"Shall I proceed with the cancellation? The refund typically takes "
+                    f"5–10 business days to appear on your statement."
+                ))
+            elif any(w in text_lower for w in ["status", "where", "refund status"]):
+                responses.append(("text",
+                    f"📊 **Booking Status for {st.session_state.pnr}:**\n\n"
+                    f"• Status: **Confirmed** ✅\n"
+                    f"• Payment: **Completed** ✅\n"
+                    f"• E-ticket: **Delivered** ✅\n\n"
+                    f"Everything looks good! Need anything else?"
+                ))
+            else:
+                responses.append(("text",
+                    "I'm here to help! I can:\n\n"
+                    "• **Search for flights** — just tell me where and when\n"
+                    "• **Check your booking status** — ask about your current trip\n"
+                    "• **Plan an itinerary** — I'll create a day-by-day plan\n"
+                    "• **Help with cancellations** — I'll handle the refund process\n\n"
+                    "What would you like to do?"
+                ))
 
     return responses
 
 
+# ════════════════════════════════════════════════════════════════════════════════
 # SIDEBAR
+# ════════════════════════════════════════════════════════════════════════════════
 
 with st.sidebar:
     st.markdown("## ✈️ SkyAgent AI")
@@ -1517,7 +2166,7 @@ with st.sidebar:
 
     st.markdown("### 👤 Traveler Profile")
     st.markdown("""
-    **Ali Ahmed**
+    **Ahmed Khan**
     📧 ahmed@email.com
     ✈️ Preferred: Window Seat, Halal Meals
     💳 Visa •••• 4242 (Citi Travel)
@@ -1542,8 +2191,28 @@ with st.sidebar:
     - ✅ Trip itinerary generation
     - ✅ Multi-currency detection
     - ✅ Cancellation & refunds
+    - ✅ AI-powered conversation
     - 🔜 Real-time alerts
     """)
+
+    st.markdown("---")
+
+    # AI Engine status
+    st.markdown("### 🤖 AI Engine")
+    client = get_groq_client()
+    if client:
+        st.success("Connected · Llama 3.3 70B", icon="✅")
+    else:
+        st.warning("No API key — using rule-based mode", icon="⚠️")
+        api_key_input = st.text_input(
+            "Groq API Key",
+            type="password",
+            placeholder="gsk_...",
+            help="Get a free key at console.groq.com",
+        )
+        if api_key_input:
+            st.session_state.groq_api_key = api_key_input
+            st.rerun()
 
     st.markdown("---")
     st.markdown(
@@ -1568,16 +2237,16 @@ with st.sidebar:
         st.rerun()
 
 
+# ════════════════════════════════════════════════════════════════════════════════
 # MAIN CHAT INTERFACE
+# ════════════════════════════════════════════════════════════════════════════════
 
 # Header
 st.markdown(
-    '<div style="text-align:center;padding:8px 0 24px 0;">'
-    '<span style="font-size:36px;">✈️</span><br>'
-    '<span style="font-family:\'DM Sans\',sans-serif;font-size:24px;font-weight:700;color:#0f172a;">'
-    'SkyAgent AI</span><br>'
-    '<span style="font-family:\'DM Sans\',sans-serif;font-size:14px;color:#64748b;">'
-    'Your AI-powered travel agent · Flight booking · Hotel reservation · Trip planning</span>'
+    '<div class="app-header">'
+    '<div class="app-header-icon">✈️</div>'
+    '<div class="app-header-title">SkyAgent AI</div>'
+    '<div class="app-header-sub">Your AI-Powered Travel Agent · Flights · Hotels · Trip Planning</div>'
     '</div>',
     unsafe_allow_html=True,
 )
